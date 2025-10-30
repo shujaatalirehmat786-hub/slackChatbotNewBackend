@@ -16,61 +16,50 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.post('/slack/events', async (req, res) => {
   const { event, challenge } = req.body;
 
-  // Slack URL verification
-  if (challenge) {
-    return res.status(200).send({ challenge });
-  }
-
-  // Respond quickly to avoid Slack retries
+  if (challenge) return res.status(200).send({ challenge });
   res.sendStatus(200);
 
   try {
-    // Ignore bot's own messages
     if (!event || event.bot_id) return;
 
-    // Handle only mentions (or optionally DMs)
     if (event.type === 'app_mention' || event.channel_type === 'im') {
-      // Clean mention text
       const userMessage = event.text.replace(/<@[^>]+>/, '').trim();
 
-      // Fetch last 20 messages from the channel
+      // Fetch last 20 messages for context
       const history = await slackClient.conversations.history({
         channel: event.channel,
         limit: 20,
       });
 
-      // Prepare past conversation messages
-      const pastMessages = history.messages
+      // Convert Slack messages into chat format for OpenAI
+      const contextMessages = history.messages
         .reverse()
-        .map((msg) => msg.text)
-        .join('\n');
+        .map((msg) => ({
+          role: msg.user === event.user ? 'user' : 'assistant',
+          content: msg.text,
+        }));
 
-      // Combine context + user request
-      const prompt = `
-Here are the recent messages in this Slack channel:
+      contextMessages.push({
+        role: 'user',
+        content: userMessage,
+      });
 
-${pastMessages}
-
-Now, based on this conversation context, answer this user's new message naturally:
-"${userMessage}"
-      `;
-
-      // Send context to OpenAI
+      // Generate context-based reply
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
           {
             role: 'system',
             content:
-              'You are an assistant for a Slack workspace. Analyze the past channel discussion and reply naturally and contextually based on it.',
+              'You are a Slack assistant. You already have the recent Slack messages as context, so never say you lack access to Slack. Respond conversationally and helpfully based on this context.',
           },
-          { role: 'user', content: prompt },
+          ...contextMessages,
         ],
       });
 
       const reply = completion.choices[0].message.content;
 
-      // Reply to Slack (in thread for better UX)
+      // Reply in thread
       await slackClient.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
@@ -81,6 +70,7 @@ Now, based on this conversation context, answer this user's new message naturall
     console.error('Error handling Slack event:', err);
   }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💬 Slack GPT Context Bot running on port ${PORT}`));
