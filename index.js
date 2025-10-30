@@ -12,88 +12,65 @@ app.use(bodyParser.json());
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Store short conversation memory for continuity
+// Store short conversation history per channel (in memory)
 const conversationHistory = {};
 
 // Slack event endpoint
 app.post('/slack/events', async (req, res) => {
   const { event, challenge } = req.body;
 
-  // Slack URL verification
-  if (challenge) return res.status(200).send({ challenge });
+  // Slack verification handshake
+  if (challenge) {
+    return res.status(200).send({ challenge });
+  }
 
-  // Respond quickly to avoid Slack retry
+  // Always respond quickly to avoid retries
   res.sendStatus(200);
 
   try {
+    // Ignore bot’s own messages
     if (!event || event.bot_id) return;
 
-    // Handle @mentions or direct messages
+    // Handle only mentions or direct messages
     if (event.type === 'app_mention' || event.channel_type === 'im') {
       const userMessage = event.text.replace(/<@[^>]+>/, '').trim();
 
-      // --- 1️⃣ Fetch recent messages from Slack channel ---
+      // 1️⃣ Fetch last 20 messages from the same channel
       const history = await slackClient.conversations.history({
         channel: event.channel,
-        limit: 15, // last 15 messages
+        limit: 20,
       });
 
-      // Format Slack messages into readable context
+      // Build a context summary for GPT
       const recentMessages = history.messages
-        .reverse() // so oldest first
-        .map((msg) => {
-          const username = msg.user || 'someone';
-          const text = msg.text || '';
-          return `${username}: ${text}`;
-        })
+        .map((msg) => `${msg.user || 'unknown'}: ${msg.text}`)
         .join('\n');
 
-      // --- 2️⃣ Maintain short memory per channel ---
-      if (!conversationHistory[event.channel]) {
-        conversationHistory[event.channel] = [];
-      }
+      // 2️⃣ Build prompt with context + current message
+      const prompt = `
+You are a helpful, friendly Slack assistant.
+Below are the last 20 messages from this Slack channel:
 
-      conversationHistory[event.channel].push({
-        role: 'user',
-        content: userMessage,
-      });
-
-      // Keep only 10 last messages in memory
-      if (conversationHistory[event.channel].length > 10) {
-        conversationHistory[event.channel] = conversationHistory[event.channel].slice(-10);
-      }
-
-      // --- 3️⃣ Create contextual GPT prompt ---
-      const systemPrompt = `
-You are a helpful Slack assistant.
-Use the following recent Slack messages and conversation memory for context.
-If a user asks about something not in the context, politely say you can’t see older messages.
-
-Recent Slack messages:
 ${recentMessages}
-`;
 
-      // --- 4️⃣ Send to OpenAI ---
+Now respond to the user’s new message:
+"${userMessage}"
+      `;
+
+      // 3️⃣ Send message to OpenAI
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: systemPrompt },
-          ...conversationHistory[event.channel],
+          { role: 'system', content: prompt },
         ],
       });
 
       const reply = completion.choices[0].message.content;
 
-      // --- 5️⃣ Store and send reply back to Slack ---
-      conversationHistory[event.channel].push({
-        role: 'assistant',
-        content: reply,
-      });
-
+      // 4️⃣ Reply to Slack
       await slackClient.chat.postMessage({
         channel: event.channel,
         text: reply,
-        thread_ts: event.ts, // reply in thread for clarity
       });
     }
   } catch (err) {
@@ -101,6 +78,6 @@ ${recentMessages}
   }
 });
 
-// --- Start server ---
+// Start the bot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🤖 Slack GPT Bot running on port ${PORT}`));
