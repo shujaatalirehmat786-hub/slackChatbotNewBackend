@@ -1,83 +1,106 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { App, ExpressReceiver } from '@slack/bolt';
+import { WebClient } from '@slack/web-api';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// --- Setup OpenAI client ---
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const app = express();
+app.use(bodyParser.json());
 
-// --- Setup Express receiver (so we can define app.post) ---
-const receiver = new ExpressReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-});
+const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- Create a Slack Bolt app with custom receiver ---
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  receiver,
-});
+// Store short conversation memory for continuity
+const conversationHistory = {};
 
-// --- POST route for Slack Event Subscriptions ---
-receiver.router.post('/slack/events', bodyParser.json(), async (req, res) => {
-  const { challenge } = req.body;
+// Slack event endpoint
+app.post('/slack/events', async (req, res) => {
+  const { event, challenge } = req.body;
 
-  // Handle Slack's URL verification
-  if (challenge) {
-    return res.status(200).send({ challenge });
-  }
+  // Slack URL verification
+  if (challenge) return res.status(200).send({ challenge });
 
-  // Immediately acknowledge receipt
+  // Respond quickly to avoid Slack retry
   res.sendStatus(200);
-});
 
-// --- Event listener for @mentions ---
-app.event('app_mention', async ({ event, client, say }) => {
   try {
-    // 1️⃣ Fetch last 20 messages from the same channel
-    const history = await client.conversations.history({
-      channel: event.channel,
-      limit: 20,
-    });
+    if (!event || event.bot_id) return;
 
-    const messages = history.messages
-      .map((msg) => `• ${msg.user || 'unknown'}: ${msg.text}`)
-      .join('\n');
+    // Handle @mentions or direct messages
+    if (event.type === 'app_mention' || event.channel_type === 'im') {
+      const userMessage = event.text.replace(/<@[^>]+>/, '').trim();
 
-    // 2️⃣ Create GPT prompt using context
-    const prompt = `
+      // --- 1️⃣ Fetch recent messages from Slack channel ---
+      const history = await slackClient.conversations.history({
+        channel: event.channel,
+        limit: 15, // last 15 messages
+      });
+
+      // Format Slack messages into readable context
+      const recentMessages = history.messages
+        .reverse() // so oldest first
+        .map((msg) => {
+          const username = msg.user || 'someone';
+          const text = msg.text || '';
+          return `${username}: ${text}`;
+        })
+        .join('\n');
+
+      // --- 2️⃣ Maintain short memory per channel ---
+      if (!conversationHistory[event.channel]) {
+        conversationHistory[event.channel] = [];
+      }
+
+      conversationHistory[event.channel].push({
+        role: 'user',
+        content: userMessage,
+      });
+
+      // Keep only 10 last messages in memory
+      if (conversationHistory[event.channel].length > 10) {
+        conversationHistory[event.channel] = conversationHistory[event.channel].slice(-10);
+      }
+
+      // --- 3️⃣ Create contextual GPT prompt ---
+      const systemPrompt = `
 You are a helpful Slack assistant.
-Here are the last 20 messages from this channel:
+Use the following recent Slack messages and conversation memory for context.
+If a user asks about something not in the context, politely say you can’t see older messages.
 
-${messages}
-
-Now answer based only on that conversation.
-User asked: "${event.text}"
+Recent Slack messages:
+${recentMessages}
 `;
 
-    // 3️⃣ Send context to GPT
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'system', content: prompt }],
-    });
+      // --- 4️⃣ Send to OpenAI ---
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...conversationHistory[event.channel],
+        ],
+      });
 
-    const reply = completion.choices[0].message.content;
+      const reply = completion.choices[0].message.content;
 
-    // 4️⃣ Reply in Slack
-    await say(reply);
-  } catch (error) {
-    console.error('❌ Error in app_mention:', error);
-    await say('Sorry, something went wrong while fetching messages.');
+      // --- 5️⃣ Store and send reply back to Slack ---
+      conversationHistory[event.channel].push({
+        role: 'assistant',
+        content: reply,
+      });
+
+      await slackClient.chat.postMessage({
+        channel: event.channel,
+        text: reply,
+        thread_ts: event.ts, // reply in thread for clarity
+      });
+    }
+  } catch (err) {
+    console.error('❌ Error handling Slack event:', err);
   }
 });
 
 // --- Start server ---
-(async () => {
-  const port = process.env.PORT || 3000;
-  await app.start(port);
-  console.log(`⚡️ Slack GPT bot running and listening on port ${port}`);
-})();
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🤖 Slack GPT Bot running on port ${PORT}`));
