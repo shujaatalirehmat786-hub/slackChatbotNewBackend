@@ -21,19 +21,19 @@ app.post("/slack/events", async (req, res) => {
     return res.status(200).send({ challenge });
   }
 
-  // Respond quickly so Slack doesn't retry
+  // Respond quickly so Slack doesn’t retry
   res.sendStatus(200);
 
   try {
     // Ignore bot's own messages
     if (!event || event.bot_id) return;
 
-    // Only respond to app mentions or direct messages
+    // Only respond to mentions or DMs
     if (event.type === "app_mention" || event.channel_type === "im") {
       const channelId = event.channel;
       const userMessage = event.text.replace(/<@[^>]+>/, "").trim();
 
-      // ✅ Fetch recent messages from the same channel
+      // ✅ Fetch last 10 messages from this channel
       const history = await slackClient.conversations.history({
         channel: channelId,
         limit: 10,
@@ -44,22 +44,27 @@ app.post("/slack/events", async (req, res) => {
         console.log(`${i + 1}. ${msg.user || "unknown"}: ${msg.text}`);
       });
 
-      // ✅ Create context for GPT
-      const messagesContext = history.messages
+      // ✅ Build context for GPT (no "I can’t access Slack" triggers)
+      const chatContext = history.messages
         .map((msg) => `${msg.user || "unknown"}: ${msg.text}`)
         .join("\n");
 
       const prompt = `
-You are a helpful assistant inside Slack.
-Use the following recent channel messages as context:
+You are an AI assistant inside a Slack workspace.
+You have already been given the following recent messages from this channel (this is all the context you need):
 
-${messagesContext}
+${chatContext}
 
-Now respond to the user's latest message:
+Now respond helpfully and naturally to the latest user message:
 "${userMessage}"
+
+Rules:
+- Do NOT say you don't have access to Slack.
+- You already have the above conversation.
+- Respond conversationally, like a human teammate.
       `;
 
-      // ✅ Ask GPT with context
+      // ✅ Send to OpenAI
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: prompt }],
@@ -69,7 +74,7 @@ Now respond to the user's latest message:
         completion.choices[0]?.message?.content ||
         "I wasn’t able to generate a proper response.";
 
-      // ✅ Send GPT reply back to Slack
+      // ✅ Send reply back to Slack
       await slackClient.chat.postMessage({
         channel: channelId,
         text: reply,
@@ -79,6 +84,7 @@ Now respond to the user's latest message:
     console.error("❌ Error handling Slack event:", error);
   }
 });
+
 
 // --- Health route for Railway ---
 app.get("/", (req, res) => {
