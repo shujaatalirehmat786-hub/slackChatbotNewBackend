@@ -1,8 +1,8 @@
-import express from 'express';
-import bodyParser from 'body-parser';
-import { WebClient } from '@slack/web-api';
-import OpenAI from 'openai';
-import dotenv from 'dotenv';
+import express from "express";
+import bodyParser from "body-parser";
+import { WebClient } from "@slack/web-api";
+import OpenAI from "openai";
+import dotenv from "dotenv";
 
 dotenv.config();
 
@@ -12,78 +12,81 @@ app.use(bodyParser.json());
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ✅ Slack event endpoint
-app.post('/slack/events', async (req, res) => {
-  const { event, challenge } = req.body;
+// --- POST endpoint for Slack Events ---
+app.post("/slack/events", async (req, res) => {
+  const { challenge, event } = req.body;
 
   // Slack URL verification
   if (challenge) {
     return res.status(200).send({ challenge });
   }
 
-  // Respond quickly to avoid timeout
+  // Respond quickly so Slack doesn't retry
   res.sendStatus(200);
 
   try {
-    // Ignore bot’s own messages
+    // Ignore bot's own messages
     if (!event || event.bot_id) return;
 
-    // Handle mentions and direct messages
-    if (event.type === 'app_mention' || event.channel_type === 'im') {
-      console.log(`📩 User mentioned bot in channel: ${event.channel}`);
+    // Only respond to app mentions or direct messages
+    if (event.type === "app_mention" || event.channel_type === "im") {
+      const channelId = event.channel;
+      const userMessage = event.text.replace(/<@[^>]+>/, "").trim();
 
-      // ✅ Fetch the last 15 messages from this specific channel
+      // ✅ Fetch recent messages from the same channel
       const history = await slackClient.conversations.history({
-        channel: event.channel,
-        limit: 15,
+        channel: channelId,
+        limit: 10,
       });
 
-      // Log the messages in console for debugging
-      console.log('📜 Recent messages in channel:');
+      console.log("📜 Recent messages from Slack channel:");
       history.messages.forEach((msg, i) => {
-        console.log(`${i + 1}. ${msg.user || 'unknown'}: ${msg.text}`);
+        console.log(`${i + 1}. ${msg.user || "unknown"}: ${msg.text}`);
       });
 
-      // Clean the user’s message (remove mention text)
-      const userMessage = event.text.replace(/<@[^>]+>/, '').trim();
+      // ✅ Create context for GPT
+      const messagesContext = history.messages
+        .map((msg) => `${msg.user || "unknown"}: ${msg.text}`)
+        .join("\n");
 
-      // Format messages as readable text
-      const formattedHistory = history.messages
-        .map((msg) => `${msg.user || 'unknown'}: ${msg.text}`)
-        .join('\n');
-
-      // Combine history + user question into one contextual prompt
       const prompt = `
-You are a helpful assistant in a Slack workspace.
-These are the latest messages from this channel:
+You are a helpful assistant inside Slack.
+Use the following recent channel messages as context:
 
-${formattedHistory}
+${messagesContext}
 
-Now, based on this context, respond naturally to the user's new message:
+Now respond to the user's latest message:
 "${userMessage}"
       `;
 
-      // Send the contextual request to ChatGPT
+      // ✅ Ask GPT with context
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'system', content: prompt }],
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
       });
 
-      const reply = completion.choices[0].message.content;
+      const reply =
+        completion.choices[0]?.message?.content ||
+        "I wasn’t able to generate a proper response.";
 
-      // Send GPT’s reply back to Slack
+      // ✅ Send GPT reply back to Slack
       await slackClient.chat.postMessage({
-        channel: event.channel,
+        channel: channelId,
         text: reply,
       });
-
-      console.log('✅ Reply sent to Slack successfully.');
     }
-  } catch (err) {
-    console.error('❌ Error handling Slack event:', err);
+  } catch (error) {
+    console.error("❌ Error handling Slack event:", error);
   }
 });
 
-// Start the bot
+// --- Health route for Railway ---
+app.get("/", (req, res) => {
+  res.send("✅ Slack GPT bot backend is running.");
+});
+
+// --- Start server ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🤖 Slack GPT Bot running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Slack GPT bot running on port ${PORT}`);
+});
